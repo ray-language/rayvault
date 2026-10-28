@@ -1,0 +1,61 @@
+//! Everything together: the vault fiber, the audit log, and the API over HTTP or HTTPS.
+
+import oidc/provider;
+import std/fs;
+import std/net;
+import net/webserver;
+import api;
+import audit;
+import config;
+import vault;
+
+pub struct Running {
+    port: int,
+    v: Channel<vault.Msg>,
+    log: Channel<audit.Msg>,
+    stop: Channel<int>,
+    done: Channel<Result<int, string>>,
+}
+
+/// Starts the vault (sealed, or uninitialized) and serves the API on `listener`. `providers`
+/// holds the discovered issuer, if any; `iterations` is the PBKDF2 work for a new vault.
+pub fn start(
+    cfg: config.Config,
+    listener: int,
+    providers: [provider.Provider],
+    iterations: int
+) -> Result<Running, string> {
+    fs.mkdir(cfg.data)?;
+    let v = vault.start("${cfg.data}/vault.db", iterations)?;
+    let log = audit.start("${cfg.data}/audit.log")?;
+    var opts = webserver.options();
+    if (cfg.tls_cert != "") {
+        opts.tls_cert = fs.read_file(cfg.tls_cert)?;
+        opts.tls_key = fs.read_file(cfg.tls_key)?;
+    }
+    let stop: Channel<int> = Channel.bounded(1);
+    let done: Channel<Result<int, string>> = Channel.bounded(1);
+    opts.drain_ms = 2000;
+    opts.stop = stop;
+    opts.has_stop = true;
+    opts.no_stdout = true;
+    let ctx = api.Ctx { cfg: cfg, v: v, log: log, providers: providers };
+    spawn(fn() {
+        let r = webserver.serve_options_on(
+            listener,
+            opts,
+            fn() -> fn(webserver.Request) -> webserver.Response {
+                fn(req: webserver.Request) -> webserver.Response { api.handle(ctx, req) }
+            }
+        );
+        send(done, r);
+    });
+    Result.Ok(Running { port: net.local_port(listener), v: v, log: log, stop: stop, done: done })
+}
+
+pub fn stop(r: Running) {
+    send(r.stop, 1);
+    recv(r.done);
+    vault.stop(r.v);
+    audit.stop(r.log);
+}

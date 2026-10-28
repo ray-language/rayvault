@@ -1,0 +1,218 @@
+//! `rayvault.toml`: where to listen, where the data lives, who vouches for callers, and who may
+//! do what.
+//!
+//! ```toml
+//! [server]
+//! listen = "127.0.0.1:8200"
+//! data = "data"                      # the database and the audit log
+//! tls_cert = "cert.pem"              # both or neither; without them, plain HTTP (development)
+//! tls_key = "key.pem"
+//! issuer = "https://auth.example"    # rayauth (any OIDC provider with RFC 9068 tokens); "" = root token only
+//! scope = "vault"                    # the scope every access token must carry
+//! audience = ""                      # the `aud` it must carry too ("" = not checked: rayauth puts the
+//!                                    # client's own id there and ignores RFC 8707 `resource`)
+//!
+//! [[policy]]
+//! subject = "client:sync-job"        # client:<client_id>, user:<sub or username>, group:<name>, root
+//! paths = ["apps/notes/*"]           # exact paths, or a prefix ending in "/*"; "*" = everything
+//! caps = ["read", "list"]            # read, write, list, delete, wrap
+//! ```
+
+import std/fs;
+import std/toml;
+
+pub const CAPS: [string] = ["read", "write", "list", "delete", "wrap"];
+
+pub struct Policy {
+    subject: string,
+    paths: [string],
+    caps: [string],
+}
+
+pub struct Config {
+    host: string,
+    port: int,
+    data: string,
+    tls_cert: string,
+    tls_key: string,
+    issuer: string,
+    scope: string,
+    audience: string,
+    policies: [Policy],
+}
+
+pub fn defaults() -> Config {
+    Config {
+        host: "127.0.0.1",
+        port: 8200,
+        data: "data",
+        tls_cert: "",
+        tls_key: "",
+        issuer: "",
+        scope: "vault",
+        audience: "",
+        policies: []
+    }
+}
+
+pub fn load(path: string) -> Result<Config, string> {
+    parse(fs.read_file(path)?)
+}
+
+fn str_of(e: [toml.TomlEntry], key: string, default: string) -> Result<string, string> {
+    match (toml.toml_get(e, key)) {
+        Option.Some(toml.TomlValue.TStr(s)) => Result.Ok(s),
+        Option.Some(_) => Result.Err("${key} must be a string"),
+        Option.None => Result.Ok(default),
+    }
+}
+
+fn strings_of(e: [toml.TomlEntry], key: string) -> Result<[string], string> {
+    var out: [string] = [];
+    match (toml.toml_get(e, key)) {
+        Option.Some(toml.TomlValue.TArray(items)) => {
+            for it in items {
+                match (it) {
+                    toml.TomlValue.TStr(s) => out.push(s),
+                    _ => return Result.Err("${key} must hold strings"),
+                }
+            }
+        },
+        Option.Some(_) => return Result.Err("${key} must be an array of strings"),
+        Option.None => { },
+    }
+    Result.Ok(out)
+}
+
+pub fn parse(src: string) -> Result<Config, string> {
+    let e = toml.parse_toml(src)?;
+    var c = defaults();
+    let listen = str_of(e, "server.listen", "${c.host}:${c.port}")?;
+    match (listen.last_index_of(":")) {
+        Option.Some(i) => {
+            c.host = listen.substring(0, i);
+            c.port = match (parse_int(listen.substring(i + 1, listen.len()))) {
+                Option.Some(p) => p,
+                Option.None => return Result.Err("server.listen: bad port in '${listen}'"),
+            };
+        },
+        Option.None => return Result.Err("server.listen must be HOST:PORT"),
+    }
+    c.data = str_of(e, "server.data", c.data)?;
+    c.tls_cert = str_of(e, "server.tls_cert", "")?;
+    c.tls_key = str_of(e, "server.tls_key", "")?;
+    if ((c.tls_cert == "") != (c.tls_key == "")) {
+        return Result.Err("server.tls_cert and server.tls_key go together");
+    }
+    c.issuer = str_of(e, "server.issuer", "")?
+        .strip_suffix("/")
+        .unwrap_or(str_of(e, "server.issuer", "")?);
+    c.scope = str_of(e, "server.scope", c.scope)?;
+    c.audience = str_of(e, "server.audience", c.audience)?;
+    for i in 0..toml.toml_array_len(
+        e,
+        "policy"
+    ) {
+        let p = "policy.${i}";
+        let subject = str_of(e, "${p}.subject", "")?;
+        let ok_subject = subject == "root"
+            || subject.starts_with("client:")
+            || subject.starts_with("user:")
+            || subject.starts_with("group:");
+        if (!ok_subject) {
+            return Result.Err(
+                "[[policy]] ${i + 1}: subject must be root, client:ID, user:NAME or group:NAME, not '${subject}'"
+            );
+        }
+        let paths = strings_of(e, "${p}.paths")?;
+        let caps = strings_of(e, "${p}.caps")?;
+        if (paths.len() == 0 || caps.len() == 0) {
+            return Result.Err("[[policy]] ${subject}: needs paths and caps");
+        }
+        for cap in caps {
+            if (!CAPS.contains(cap)) {
+                return Result.Err(
+                    "[[policy]] ${subject}: unknown cap '${cap}' (${join(CAPS, ", ")})"
+                );
+            }
+        }
+        c.policies.push(Policy { subject: subject, paths: paths, caps: caps });
+    }
+    Result.Ok(c)
+}
+
+/// A path pattern: `*` (everything), `prefix/*` (everything under it), or an exact path.
+pub fn path_matches(pattern: string, path: string) -> bool {
+    if (pattern == "*") {
+        return true;
+    }
+    match (pattern.strip_suffix("/*")) {
+        Option.Some(prefix) => path.starts_with(prefix + "/"),
+        Option.None => pattern == path,
+    }
+}
+
+/// Whether any policy of any of the caller's `subjects` grants `cap` on `path`. The root token
+/// is the subject `root`, which is given everything.
+pub fn allows(c: Config, subjects: [string], cap: string, path: string) -> bool {
+    if (subjects.contains("root")) {
+        return true;
+    }
+    for p in c.policies {
+        if (subjects.contains(p.subject) && p.caps.contains(cap)) {
+            for pat in p.paths {
+                if (path_matches(pat, path)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// For a listing: whether the caller may list under `prefix` (a policy on `prefix/*` or on a
+/// path below it).
+pub fn may_list(c: Config, subjects: [string], prefix: string) -> bool {
+    if (subjects.contains("root")) {
+        return true;
+    }
+    for p in c.policies {
+        if (subjects.contains(p.subject) && p.caps.contains("list")) {
+            for pat in p.paths {
+                let base = pat.strip_suffix("/*").unwrap_or(pat);
+                if (pat == "*"
+                    || prefix == ""
+                    || base == prefix
+                    || base.starts_with(prefix + "/")
+                    || prefix.starts_with(base + "/")) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// A secret path: segments of `A-Z a-z 0-9 . _ -`, no empty segment, no `.` or `..`, at most 512.
+pub fn valid_path(p: string) -> bool {
+    if (p == "" || p.len() > 512) {
+        return false;
+    }
+    for seg in p.split("/") {
+        if (seg == "" || seg == "." || seg == "..") {
+            return false;
+        }
+        for ch in seg.chars() {
+            let ok = (ch >= 'a' && ch <= 'z')
+                || (ch >= 'A' && ch <= 'Z')
+                || (ch >= '0' && ch <= '9')
+                || ch == '.'
+                || ch == '_'
+                || ch == '-';
+            if (!ok) {
+                return false;
+            }
+        }
+    }
+    true
+}

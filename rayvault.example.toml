@@ -1,0 +1,23 @@
+# rayvault configuration. Copy to rayvault.toml.
+
+[server]
+listen = "127.0.0.1:8200"
+data = "data"                       # vault.db (sealed) and audit.log
+# TLS: PEM files; without them, plain HTTP (development only).
+# tls_cert = "/etc/rayvault/cert.pem"
+# tls_key = "/etc/rayvault/key.pem"
+issuer = "https://auth.example"     # rayauth; "" = the root token only
+scope = "vault"                     # every access token must carry it
+audience = ""                       # and this aud, if set (rayauth puts the client's own id there)
+
+# A service account (client credentials in rayauth) that reads its app's secrets.
+[[policy]]
+subject = "client:REPLACE-WITH-THE-CLIENT-ID"
+paths = ["apps/notes/*"]
+caps = ["read", "list"]
+
+# People in a rayauth group manage everything under apps/.
+[[policy]]
+subject = "group:ops"
+paths = ["apps/*"]
+caps = ["read", "write", "list", "delete", "wrap"]

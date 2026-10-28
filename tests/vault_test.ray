@@ -1,0 +1,195 @@
+// The pieces on their own: the keyring, the vault fiber, the audit chain and the policies.
+
+import std/fs;
+import std/time;
+import audit;
+import config;
+import keyring;
+import vault;
+
+const PASS: string = "correct horse battery staple";
+
+@test
+fn keyring_wraps_and_binds() {
+    let (dek, w) = keyring.create(PASS, 1000).unwrap();
+    assert_eq(keyring.open(PASS, w).unwrap(), dek);
+    assert_eq(keyring.open("wrong passphrase!", w), Result.Err("wrong passphrase"));
+    let sealed = keyring.seal(dek, "apps/db", 3, "hunter2").unwrap();
+    assert_eq(keyring.unseal_value(dek, "apps/db", 3, sealed).unwrap(), "hunter2");
+    // Moved to another path or version, the same ciphertext no longer opens.
+    assert(keyring.unseal_value(dek, "apps/other", 3, sealed).is_err());
+    assert(keyring.unseal_value(dek, "apps/db", 4, sealed).is_err());
+    // And two seals of the same value differ (fresh nonces).
+    assert(keyring.seal(dek, "apps/db", 3, "hunter2").unwrap() != sealed);
+}
+
+@test
+fn the_vault_fiber() {
+    let dir = fs.make_temp_dir("rayvault-v").unwrap();
+    let v = vault.start("${dir}/vault.db", 1000).unwrap();
+    assert_eq((vault.status(v).initialized, vault.status(v).sealed), (false, true));
+    assert_eq(vault.put(v, "a/b", "x", 0, "t"), Result.Err("not initialized"));
+    assert(vault.init(v, "short").is_err());
+    let root = vault.init(v, PASS).unwrap();
+    assert(root.starts_with("rvr_"));
+    assert(vault.is_root(v, root) && !vault.is_root(v, "rvr_nope"));
+    assert(vault.init(v, PASS).is_err());
+
+    assert_eq(vault.put(v, "apps/notes/db", "one", 0, "alice"), Result.Ok(1));
+    assert_eq(vault.put(v, "apps/notes/db", "two", 0, "alice"), Result.Ok(2));
+    assert_eq(vault.get(v, "apps/notes/db", 0).unwrap().value, "two");
+    assert_eq(vault.get(v, "apps/notes/db", 1).unwrap().value, "one");
+    vault.put(v, "apps/notes/api-key", "k", 0, "alice");
+    vault.put(v, "apps/web/tls", "t", 0, "alice");
+    assert_eq(vault.list(v, "").unwrap(), ["apps/"]);
+    assert_eq(vault.list(v, "apps").unwrap(), ["notes/", "web/"]);
+    assert_eq(vault.list(v, "apps/notes").unwrap(), ["api-key", "db"]);
+
+    // A secret with a lifetime.
+    vault.put(v, "tmp/token", "soon gone", 150, "alice");
+    assert_eq(vault.get(v, "tmp/token", 0).unwrap().value, "soon gone");
+    time.sleep(200);
+    assert_eq(
+        vault.get(v, "tmp/token", 0).map(fn(s: vault.Secret) -> string { s.value }),
+        Result.Err("expired")
+    );
+
+    // Only the last ten versions are kept.
+    for i in 0..12 {
+        vault.put(v, "many", "v${i}", 0, "alice");
+    }
+    assert_eq(
+        vault.get(v, "many", 1).map(fn(s: vault.Secret) -> string { s.value }),
+        Result.Err("not found")
+    );
+    assert_eq(vault.get(v, "many", 3).unwrap().value, "v2");
+
+    // A wrap delivers once.
+    let (t, version, _) = vault.wrap(v, "apps/notes/db", 60000).unwrap();
+    assert_eq(version, 2);
+    assert_eq(vault.unwrap(v, t).unwrap().value, "two");
+    assert_eq(
+        vault.unwrap(v, t).map(fn(s: vault.Secret) -> string { s.value }),
+        Result.Err("unknown or already used")
+    );
+
+    // Sealed, nothing reads; after a restart, sealed again until the passphrase comes back.
+    vault.seal(v);
+    assert_eq(
+        vault.get(v, "apps/notes/db", 0).map(fn(s: vault.Secret) -> string { s.value }),
+        Result.Err("sealed")
+    );
+    assert_eq(vault.unseal(v, "not the passphrase"), Result.Err("wrong passphrase"));
+    vault.stop(v);
+    let v2 = vault.start("${dir}/vault.db", 1000).unwrap();
+    assert_eq((vault.status(v2).initialized, vault.status(v2).sealed), (true, true));
+    assert(vault.unseal(v2, PASS).is_ok());
+    assert_eq(vault.get(v2, "apps/notes/db", 0).unwrap().value, "two");
+    assert(vault.delete(v2, "apps/notes/db").is_ok());
+    assert_eq(vault.delete(v2, "apps/notes/db"), Result.Err("not found"));
+    vault.stop(v2);
+    // On disk: no plaintext anywhere.
+    let raw = fs.read_file_bytes("${dir}/vault.db").unwrap();
+    assert(
+        raw.index_of("hunter2".to_bytes()).is_none() && raw.index_of("v11".to_bytes()).is_none()
+    );
+    fs.remove_all(dir);
+}
+
+fn err_of(r: Result<int, string>) -> string {
+    match (r) {
+        Result.Ok(_) => "",
+        Result.Err(e) => e,
+    }
+}
+
+fn entry(op: string, path: string) -> audit.Entry {
+    audit.Entry {
+        who: "client:job",
+        op: op,
+        path: path,
+        version: 1,
+        ok: true,
+        detail: "",
+        remote: "127.0.0.1"
+    }
+}
+
+@test
+fn the_audit_chain() {
+    let dir = fs.make_temp_dir("rayvault-a").unwrap();
+    let path = "${dir}/audit.log";
+    let a = audit.start(path).unwrap();
+    for i in 0..5 {
+        assert(audit.record(a, entry("read", "s${i}")).is_ok());
+    }
+    audit.stop(a);
+    assert_eq(audit.verify(path), Result.Ok(5));
+    // It goes on across restarts.
+    let a2 = audit.start(path).unwrap();
+    audit.record(a2, entry("write", "s5"));
+    audit.stop(a2);
+    assert_eq(audit.verify(path), Result.Ok(6));
+    let lines = fs.read_file(path).unwrap().split("\n").filter(fn(l: string) -> bool { l != "" });
+    // An edit, a removal, a swap: each breaks the chain where it happened.
+    let edited = [] + lines;
+    edited[2] = edited[2].replace("\"s2\"", "\"s9\"");
+    fs.write_file(path, join(edited, "\n") + "\n");
+    assert_eq(
+        audit.verify(path),
+        Result.Err("line 4: does not follow line 3 (a line was removed, reordered or edited)")
+    );
+    fs.write_file(path, join(lines.slice(0, 2) + lines.slice(3, 6), "\n") + "\n");
+    assert(err_of(audit.verify(path)).starts_with("line 3:"));
+    fs.write_file(path, join([lines[1], lines[0]] + lines.slice(2, 6), "\n") + "\n");
+    assert(err_of(audit.verify(path)).starts_with("line 1:"));
+    // A broken chain is not extended.
+    assert(audit.start(path).is_err());
+    fs.remove_all(dir);
+}
+
+@test
+fn policies() {
+    let src = `
+[[policy]]
+subject = "client:sync-job"
+paths = ["apps/notes/*"]
+caps = ["read", "list"]
+
+[[policy]]
+subject = "group:ops"
+paths = ["*"]
+caps = ["read", "write", "list", "delete", "wrap"]
+
+[[policy]]
+subject = "user:alice"
+paths = ["apps/notes/db"]
+caps = ["wrap"]
+`;
+    let c = config.parse(src).unwrap();
+    assert(config.allows(c, ["client:sync-job"], "read", "apps/notes/db"));
+    assert(!config.allows(c, ["client:sync-job"], "write", "apps/notes/db"));
+    assert(!config.allows(c, ["client:sync-job"], "read", "apps/notesX/db"));
+    assert(!config.allows(c, ["client:sync-job"], "read", "apps/notes"));
+    assert(config.allows(c, ["user:alice", "group:ops"], "delete", "anything/at/all"));
+    assert(
+        config.allows(c, ["user:alice"], "wrap", "apps/notes/db")
+            && !config.allows(c, ["user:alice"], "read", "apps/notes/db")
+    );
+    assert(config.allows(c, ["root"], "delete", "x"));
+    assert(
+        config.may_list(c, ["client:sync-job"], "apps")
+            && config.may_list(c, ["client:sync-job"], "apps/notes")
+    );
+    assert(!config.may_list(c, ["client:sync-job"], "apps/web"));
+    assert(config.parse("[[policy]]\nsubject = \"bob\"\npaths = [\"*\"]\ncaps = [\"read\"]\n")
+        .is_err());
+    assert(config.parse("[[policy]]\nsubject = \"user:bob\"\npaths = [\"*\"]\ncaps = [\"sudo\"]\n")
+        .is_err());
+    for p in ["a", "a/b-c/d.e_f", "A/B"] {
+        assert(config.valid_path(p));
+    }
+    for p in ["", "/a", "a/", "a//b", "a/../b", "a/./b", "a b", "a/ü"] {
+        assert(!config.valid_path(p));
+    }
+}

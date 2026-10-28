@@ -1,0 +1,483 @@
+//! The API, JSON over HTTP(S).
+//!
+//! ```
+//! GET    /v1/sys/status                    {initialized, sealed}            anyone
+//! POST   /v1/sys/init      {passphrase}    {root_token}, once               loopback only
+//! POST   /v1/sys/unseal    {passphrase}    {sealed: false}                  anyone with the passphrase
+//! POST   /v1/sys/seal                                                       root
+//! GET    /v1/whoami                        {name, subjects}                 any valid token
+//! GET    /v1/secret/PATH[?version=N]       {path, version, value, …}        read
+//! PUT    /v1/secret/PATH   {value, ttl?}   {version}                        write
+//! DELETE /v1/secret/PATH                                                    delete
+//! GET    /v1/list[/PREFIX]                 {keys}                           list
+//! POST   /v1/wrap/PATH     {ttl?}          {token, version, expires}        wrap
+//! POST   /v1/unwrap        {token}         the secret, once                 the wrap token itself
+//! ```
+
+import oidc/provider;
+import std/json;
+import net/webserver;
+import audit;
+import auth;
+import config;
+import vault;
+
+pub struct Ctx {
+    cfg: config.Config,
+    v: Channel<vault.Msg>,
+    log: Channel<audit.Msg>,
+    providers: [provider.Provider],
+}
+
+const DEFAULT_WRAP_MS: int = 600000;
+
+const MAX_VALUE: int = 65536;
+
+fn reply(status: int, pairs: [(string, json.Json)]) -> webserver.Response {
+    let m: Map<string, json.Json> = Map.new();
+    for (k, v) in pairs {
+        m.insert(k, v);
+    }
+    let r = webserver.bytes_response(status, json.stringify(json.Json.JObject(m)).to_bytes());
+    r.headers.insert("Content-Type", "application/json");
+    r.headers.insert("Cache-Control", "no-store");
+    r
+}
+
+fn error(status: int, message: string) -> webserver.Response {
+    reply(status, [("error", json.Json.JStr(message))])
+}
+
+fn num(n: int) -> json.Json {
+    json.Json.JNum(n as float)
+}
+
+fn str(s: string) -> json.Json {
+    json.Json.JStr(s)
+}
+
+/// `"10m"`, `"30s"`, `"500ms"`, `"24h"`, `"7d"` → milliseconds.
+pub fn duration_ms(s: string) -> Option<int> {
+    let (digits, unit) = if (s.ends_with("ms")) {
+        (s.substring(0, s.len() - 2), 1)
+    } else if (s.ends_with("s")) {
+        (s.substring(0, s.len() - 1), 1000)
+    } else if (s.ends_with("m")) {
+        (s.substring(0, s.len() - 1), 60000)
+    } else if (s.ends_with("h")) {
+        (s.substring(0, s.len() - 1), 3600000)
+    } else if (s.ends_with("d")) {
+        (s.substring(0, s.len() - 1), 86400000)
+    } else {
+        return Option.None;
+    };
+    let n = parse_int(digits)?;
+    if (n < 1 || n > 3650 * 86400) { Option.None } else { Option.Some(n * unit) }
+}
+
+// The status code for a vault error.
+fn vault_error(e: string) -> webserver.Response {
+    match (e) {
+        "sealed" => error(503, "sealed"),
+        "not initialized" => error(503, "not initialized"),
+        "not found" => error(404, "not found"),
+        "expired" => error(404, "expired"),
+        "unknown or already used" => error(404, e),
+        _ => error(500, e),
+    }
+}
+
+fn body_json(req: webserver.Request) -> Result<json.Json, webserver.Response> {
+    match (webserver.request_text(req)) {
+        Result.Ok(t) => if (t.trim() == "") {
+            Result.Ok(json.Json.JObject(Map.new()))
+        } else {
+            json.parse(t)
+                .map_err(fn(e: string) -> webserver.Response { error(400, "bad JSON: ${e}") })
+        },
+        Result.Err(_) => Result.Err(error(400, "the body is not UTF-8")),
+    }
+}
+
+fn is_loopback(req: webserver.Request) -> bool {
+    let ip = webserver.remote_ip(req);
+    ip == "127.0.0.1" || ip == "::1" || ip.starts_with("::ffff:127.")
+}
+
+// Writes the audit line; if that fails, the request fails with it.
+fn audited(
+    ctx: Ctx,
+    req: webserver.Request,
+    who: string,
+    op: string,
+    path: string,
+    version: int,
+    ok: bool,
+    detail: string,
+    r: webserver.Response
+) -> webserver.Response {
+    let e = audit.Entry {
+        who: who,
+        op: op,
+        path: path,
+        version: version,
+        ok: ok,
+        detail: detail,
+        remote: webserver.remote_ip(req)
+    };
+    match (audit.record(ctx.log, e)) {
+        Result.Ok(_) => r,
+        Result.Err(err) => {
+            eprint("rayvault: audit write failed: ${err}");
+            error(500, "audit log unavailable")
+        },
+    }
+}
+
+pub fn handle(ctx: Ctx, req: webserver.Request) -> webserver.Response {
+    let p = req.path;
+    if (p == "/v1/sys/status" && req.method == "GET") {
+        let s = vault.status(ctx.v);
+        return reply(
+            200,
+            [("initialized", json.Json.JBool(s.initialized)), ("sealed", json.Json.JBool(s.sealed))]
+        );
+    }
+    if (p == "/v1/sys/init" && req.method == "POST") {
+        return init(ctx, req);
+    }
+    if (p == "/v1/sys/unseal" && req.method == "POST") {
+        return unseal(ctx, req);
+    }
+    if (p == "/v1/unwrap" && req.method == "POST") {
+        return unwrap(ctx, req);
+    }
+    // Everything else needs a token.
+    let token = match (auth.bearer(req.headers.get_or("authorization", ""))) {
+        Option.Some(t) => t,
+        Option.None => return error(401, "a bearer token is required"),
+    };
+    let who = match (auth.identify(ctx.v, ctx.providers, ctx.cfg.scope, ctx.cfg.audience, token)) {
+        Result.Ok(w) => w,
+        Result.Err(e) => return audited(ctx, req, "?", "auth", "", 0, false, e, error(401, "invalid token: ${e}")),
+    };
+    if (p == "/v1/whoami" && req.method == "GET") {
+        return reply(
+            200,
+            [("name", str(who.name)), ("subjects", json.Json.JArray(who.subjects.map(str)))]
+        );
+    }
+    if (p == "/v1/sys/seal" && req.method == "POST") {
+        if (!who.subjects.contains("root")) {
+            return audited(
+                ctx,
+                req,
+                who.name,
+                "seal",
+                "",
+                0,
+                false,
+                "not root",
+                error(403, "only the root token seals")
+            );
+        }
+        vault.seal(ctx.v);
+        return audited(
+            ctx,
+            req,
+            who.name,
+            "seal",
+            "",
+            0,
+            true,
+            "",
+            reply(200, [("sealed", json.Json.JBool(true))])
+        );
+    }
+    if (p == "/v1/list" || p.starts_with("/v1/list/")) {
+        let prefix = p.strip_prefix("/v1/list").unwrap_or("").strip_prefix("/").unwrap_or("");
+        return list(ctx, req, who, prefix.strip_suffix("/").unwrap_or(prefix));
+    }
+    match (p.strip_prefix("/v1/secret/")) {
+        Option.Some(path) => return secret(ctx, req, who, path),
+        Option.None => { },
+    }
+    match (p.strip_prefix("/v1/wrap/")) {
+        Option.Some(path) => if (req.method == "POST") {
+            return wrap(ctx, req, who, path);
+        },
+        Option.None => { },
+    }
+    error(404, "no such endpoint")
+}
+
+fn passphrase_of(req: webserver.Request) -> Result<string, webserver.Response> {
+    let j = body_json(req)?;
+    match (json.get_string(j, "passphrase")) {
+        Option.Some(s) => Result.Ok(s),
+        Option.None => Result.Err(error(400, "passphrase is required")),
+    }
+}
+
+fn init(ctx: Ctx, req: webserver.Request) -> webserver.Response {
+    if (!is_loopback(req)) {
+        return audited(
+            ctx,
+            req,
+            "?",
+            "init",
+            "",
+            0,
+            false,
+            "not loopback",
+            error(403, "init is only accepted from the machine itself")
+        );
+    }
+    let pass = match (passphrase_of(req)) {
+        Result.Ok(p) => p,
+        Result.Err(r) => return r,
+    };
+    match (vault.init(ctx.v, pass)) {
+        Result.Ok(root) => audited(ctx, req, "?", "init", "", 0, true, "", reply(200, [("root_token", str(root))])),
+        Result.Err(e) => audited(ctx, req, "?", "init", "", 0, false, e, error(400, e)),
+    }
+}
+
+fn unseal(ctx: Ctx, req: webserver.Request) -> webserver.Response {
+    let pass = match (passphrase_of(req)) {
+        Result.Ok(p) => p,
+        Result.Err(r) => return r,
+    };
+    match (vault.unseal(ctx.v, pass)) {
+        Result.Ok(_) => audited(
+            ctx,
+            req,
+            "?",
+            "unseal",
+            "",
+            0,
+            true,
+            "",
+            reply(200, [("sealed", json.Json.JBool(false))])
+        ),
+        Result.Err("wrong passphrase") => audited(
+            ctx,
+            req,
+            "?",
+            "unseal",
+            "",
+            0,
+            false,
+            "wrong passphrase",
+            error(403, "wrong passphrase")
+        ),
+        Result.Err(e) => audited(ctx, req, "?", "unseal", "", 0, false, e, vault_error(e)),
+    }
+}
+
+fn secret_json(s: vault.Secret) -> [(string, json.Json)] {
+    [
+        ("path", str(s.path)),
+        ("version", num(s.version)),
+        ("value", str(s.value)),
+        ("created_ms", num(s.created_ms)),
+        ("expires_ms", num(s.expires_ms)),
+        ("by", str(s.by))
+    ]
+}
+
+fn op_of(method: string) -> (string, string) {
+    match (method) {
+        "GET" => ("read", "read"),
+        "PUT" => ("write", "write"),
+        "POST" => ("write", "write"),
+        "DELETE" => ("delete", "delete"),
+        _ => ("", ""),
+    }
+}
+
+fn secret(ctx: Ctx, req: webserver.Request, who: auth.Who, path: string) -> webserver.Response {
+    if (!config.valid_path(path)) {
+        return error(400, "a path is segments of A-Z a-z 0-9 . _ - separated by /");
+    }
+    let (op, cap) = op_of(req.method);
+    if (op == "") {
+        return error(405, "method not allowed");
+    }
+    if (!config.allows(ctx.cfg, who.subjects, cap, path)) {
+        return audited(
+            ctx,
+            req,
+            who.name,
+            op,
+            path,
+            0,
+            false,
+            "denied",
+            error(403, "no ${cap} on ${path}")
+        );
+    }
+    if (op == "read") {
+        let version = parse_int(webserver.query_params(req).get_or("version", "0")).unwrap_or(-1);
+        if (version < 0) {
+            return error(400, "bad version");
+        }
+        return match (vault.get(ctx.v, path, version)) {
+            Result.Ok(s) => audited(ctx, req, who.name, op, path, s.version, true, "", reply(200, secret_json(s))),
+            Result.Err(e) => audited(ctx, req, who.name, op, path, version, false, e, vault_error(e)),
+        };
+    }
+    if (op == "delete") {
+        return match (vault.delete(ctx.v, path)) {
+            Result.Ok(n) => audited(
+                ctx,
+                req,
+                who.name,
+                op,
+                path,
+                0,
+                true,
+                "${n} version(s)",
+                reply(200, [("deleted", num(n))])
+            ),
+            Result.Err(e) => audited(ctx, req, who.name, op, path, 0, false, e, vault_error(e)),
+        };
+    }
+    let j = match (body_json(req)) {
+        Result.Ok(j) => j,
+        Result.Err(r) => return r,
+    };
+    let value = match (json.get_string(j, "value")) {
+        Option.Some(v) => v,
+        Option.None => return error(400, "value is required (a string)"),
+    };
+    if (value.to_bytes().len() > MAX_VALUE) {
+        return error(413, "a value is at most ${MAX_VALUE} bytes");
+    }
+    let ttl = match (json.get_string(j, "ttl")) {
+        Option.Some(t) => match (duration_ms(t)) {
+            Option.Some(ms) => ms,
+            Option.None => return error(400, "bad ttl '${t}' (like 30s, 10m, 24h, 7d)"),
+        },
+        Option.None => 0,
+    };
+    match (vault.put(ctx.v, path, value, ttl, who.name)) {
+        Result.Ok(version) => audited(
+            ctx,
+            req,
+            who.name,
+            op,
+            path,
+            version,
+            true,
+            "",
+            reply(200, [("version", num(version))])
+        ),
+        Result.Err(e) => audited(ctx, req, who.name, op, path, 0, false, e, vault_error(e)),
+    }
+}
+
+fn list(ctx: Ctx, req: webserver.Request, who: auth.Who, prefix: string) -> webserver.Response {
+    if (prefix != "" && !config.valid_path(prefix)) {
+        return error(400, "bad prefix");
+    }
+    if (!config.may_list(ctx.cfg, who.subjects, prefix)) {
+        return audited(
+            ctx,
+            req,
+            who.name,
+            "list",
+            prefix,
+            0,
+            false,
+            "denied",
+            error(403, "no list on ${prefix}")
+        );
+    }
+    match (vault.list(ctx.v, prefix)) {
+        Result.Ok(keys) => audited(
+            ctx,
+            req,
+            who.name,
+            "list",
+            prefix,
+            0,
+            true,
+            "",
+            reply(200, [("keys", json.Json.JArray(keys.map(str)))])
+        ),
+        Result.Err(e) => audited(ctx, req, who.name, "list", prefix, 0, false, e, vault_error(e)),
+    }
+}
+
+fn wrap(ctx: Ctx, req: webserver.Request, who: auth.Who, path: string) -> webserver.Response {
+    if (!config.valid_path(path)) {
+        return error(400, "bad path");
+    }
+    if (!config.allows(ctx.cfg, who.subjects, "wrap", path)) {
+        return audited(
+            ctx,
+            req,
+            who.name,
+            "wrap",
+            path,
+            0,
+            false,
+            "denied",
+            error(403, "no wrap on ${path}")
+        );
+    }
+    let j = match (body_json(req)) {
+        Result.Ok(j) => j,
+        Result.Err(r) => return r,
+    };
+    let ttl = match (json.get_string(j, "ttl")) {
+        Option.Some(t) => match (duration_ms(t)) {
+            Option.Some(ms) => ms,
+            Option.None => return error(400, "bad ttl '${t}'"),
+        },
+        Option.None => DEFAULT_WRAP_MS,
+    };
+    match (vault.wrap(ctx.v, path, ttl)) {
+        Result.Ok((token, version, expires)) => audited(
+            ctx,
+            req,
+            who.name,
+            "wrap",
+            path,
+            version,
+            true,
+            "",
+            reply(
+                200,
+                [("token", str(token)), ("version", num(version)), ("expires_ms", num(expires))]
+            )
+        ),
+        Result.Err(e) => audited(ctx, req, who.name, "wrap", path, 0, false, e, vault_error(e)),
+    }
+}
+
+fn unwrap(ctx: Ctx, req: webserver.Request) -> webserver.Response {
+    let j = match (body_json(req)) {
+        Result.Ok(j) => j,
+        Result.Err(r) => return r,
+    };
+    let token = json.get_string(j, "token").unwrap_or("");
+    if (!token.starts_with("rvw_")) {
+        return error(400, "token must be a wrap token (rvw_…)");
+    }
+    match (vault.unwrap(ctx.v, token)) {
+        Result.Ok(s) => audited(
+            ctx,
+            req,
+            "wrap-token",
+            "unwrap",
+            s.path,
+            s.version,
+            true,
+            "",
+            reply(200, secret_json(s))
+        ),
+        Result.Err(e) => audited(ctx, req, "wrap-token", "unwrap", "", 0, false, e, vault_error(e)),
+    }
+}

@@ -1,0 +1,138 @@
+//! The audit log: one JSON line per request, never a secret value, each line carrying the
+//! SHA-256 of the line before it. Removing, reordering or editing a line breaks the chain
+//! from there on, and `verify` says where. One fiber writes it, and every line is synced
+//! before the request it describes is answered: no audit, no answer.
+
+import std/crypto;
+import std/fs;
+import std/hex;
+import std/json;
+import std/time;
+
+pub const GENESIS: string = "0000000000000000000000000000000000000000000000000000000000000000";
+
+pub struct Entry {
+    who: string,
+    op: string,
+    path: string,
+    version: int,
+    ok: bool,
+    detail: string,
+    remote: string,
+}
+
+pub enum Msg {
+    Record(Entry, Channel<Result<int, string>>),
+    Stop(Channel<int>),
+}
+
+fn hash(line: string) -> string {
+    hex.hex_encode(crypto.sha256(line.to_bytes()))
+}
+
+fn line_of(e: Entry, prev: string, ts: int) -> string {
+    let m: Map<string, json.Json> = Map.new();
+    m.insert("ts", json.Json.JNum(ts as float));
+    m.insert("prev", json.Json.JStr(prev));
+    m.insert("who", json.Json.JStr(e.who));
+    m.insert("op", json.Json.JStr(e.op));
+    m.insert("path", json.Json.JStr(e.path));
+    m.insert("version", json.Json.JNum(e.version as float));
+    m.insert("ok", json.Json.JBool(e.ok));
+    m.insert("detail", json.Json.JStr(e.detail));
+    m.insert("remote", json.Json.JStr(e.remote));
+    json.stringify(json.Json.JObject(m))
+}
+
+/// Checks the whole chain. `Ok(lines)`, or `Err` naming the first line that does not follow.
+pub fn verify(path: string) -> Result<int, string> {
+    if (!fs.exists(path)) {
+        return Result.Ok(0);
+    }
+    let text = fs.read_file(path)?;
+    var prev = GENESIS;
+    var n = 0;
+    for line in text.split(
+        "\n"
+    ) {
+        if (line == "") {
+            continue;
+        }
+        n = n + 1;
+        let j = match (json.parse(line)) {
+            Result.Ok(j) => j,
+            Result.Err(_) => return Result.Err("line ${n}: not JSON (a write cut short, or an edit)"),
+        };
+        if (json.get_string(j, "prev").unwrap_or("") != prev) {
+            return Result.Err(
+                "line ${n}: does not follow line ${n - 1} (a line was removed, reordered or edited)"
+            );
+        }
+        prev = hash(line);
+    }
+    Result.Ok(n)
+}
+
+// The hash the next line must carry: that of the last line, after checking the whole chain.
+fn tail_hash(path: string) -> Result<string, string> {
+    verify(path)?;
+    if (!fs.exists(path)) {
+        return Result.Ok(GENESIS);
+    }
+    var last = "";
+    for line in fs.read_file(path)?.split("\n") {
+        if (line != "") {
+            last = line;
+        }
+    }
+    Result.Ok(if (last == "") { GENESIS } else { hash(last) })
+}
+
+/// Opens the log (checking it first: a broken chain is refused, not extended) and starts its
+/// fiber.
+pub fn start(path: string) -> Result<Channel<Msg>, string> {
+    let prev = tail_hash(
+        path
+    ).map_err(fn(e: string) -> string { "${path}: ${e}; see `rayvault audit verify`" })?;
+    let h = fs.open(path, "a")?;
+    let inbox: Channel<Msg> = Channel.bounded(256);
+    spawn(fn() {
+        var last = prev;
+        while (true) {
+            match (recv(inbox)) {
+                Option.Some(Msg.Record(e, reply)) => {
+                    let line = line_of(e, last, time.now());
+                    let r = append(h, line);
+                    if (r.is_ok()) {
+                        last = hash(line);
+                    }
+                    send(reply, r);
+                },
+                Option.Some(Msg.Stop(reply)) => {
+                    close(h);
+                    send(reply, 0);
+                    return;
+                },
+                Option.None => return,
+            }
+        }
+    });
+    Result.Ok(inbox)
+}
+
+fn append(h: int, line: string) -> Result<int, string> {
+    fs.write(h, line + "\n")?;
+    fs.sync_data(h)
+}
+
+pub fn record(a: Channel<Msg>, e: Entry) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(a, Msg.Record(e, r));
+    recv(r).unwrap_or(Result.Err("audit log stopped"))
+}
+
+pub fn stop(a: Channel<Msg>) {
+    let r: Channel<int> = Channel.bounded(1);
+    send(a, Msg.Stop(r));
+    recv(r);
+}

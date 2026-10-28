@@ -1,0 +1,322 @@
+//! rayvault: secrets over the network, with identity from rayauth.
+
+import oidc/provider;
+import std/json;
+import std/net;
+import std/term;
+import std/url;
+import net/http;
+import net/oauth2;
+import net/webserver;
+import audit;
+import config;
+import keyring;
+import server;
+
+const VERSION: string = "0.1.0";
+
+fn usage() -> string {
+    `rayvault ${VERSION} — secrets over the network, identity from rayauth
+
+server:
+  rayvault serve [--config rayvault.toml]
+  rayvault init | unseal | seal | status        the passphrase from a prompt or RAYVAULT_PASSPHRASE
+  rayvault audit verify [FILE]                  check the hash chain of the audit log
+
+secrets (token from RAYVAULT_TOKEN, or client credentials from RAYVAULT_ISSUER,
+RAYVAULT_CLIENT_ID and RAYVAULT_CLIENT_SECRET):
+  rayvault get PATH [--version N]
+  rayvault put PATH VALUE [--ttl 24h]           VALUE "-" reads it from stdin
+  rayvault ls [PREFIX]
+  rayvault rm PATH
+  rayvault wrap PATH [--ttl 10m]                a one-time token for someone without access
+  rayvault unwrap TOKEN
+  rayvault whoami
+
+common: --addr URL (RAYVAULT_ADDR, default http://127.0.0.1:8200), --insecure (accept any TLS
+certificate: development only; trust a CA with SSL_CERT_FILE instead)
+`
+}
+
+fn flag(argv: [string], name: string, default: string) -> string {
+    for i in 0..argv.len() {
+        if (argv[i] == name && i + 1 < argv.len()) {
+            return argv[i + 1];
+        }
+    }
+    default
+}
+
+fn has(argv: [string], name: string) -> bool {
+    argv.contains(name)
+}
+
+fn positional(argv: [string]) -> [string] {
+    var out: [string] = [];
+    var i = 0;
+    while (i < argv.len()) {
+        if (argv[i] == "--insecure") {
+            i = i + 1;
+        } else if (argv[i].starts_with("--")) {
+            i = i + 2;
+        } else {
+            out.push(argv[i]);
+            i = i + 1;
+        }
+    }
+    out
+}
+
+fn env_or(name: string, default: string) -> string {
+    match (env(name)) {
+        Option.Some(v) => if (v == "") { default } else { v },
+        Option.None => default,
+    }
+}
+
+fn serve(argv: [string]) -> Result<int, string> {
+    let path = flag(argv, "--config", "rayvault.toml");
+    let cfg = config.load(path).map_err(fn(e: string) -> string { "${path}: ${e}" })?;
+    var providers: [provider.Provider] = [];
+    if (cfg.issuer != "") {
+        providers.push(
+            provider.discover(cfg.issuer)
+                .map_err(fn(e: string) -> string { "issuer ${cfg.issuer}: ${e}" })?
+        );
+    }
+    let l = net.tcp_listen(cfg.host, cfg.port)?;
+    let r = server.start(cfg, l, providers, keyring.ITERATIONS)?;
+    let scheme = if (cfg.tls_cert != "") { "https" } else { "http" };
+    let aud = if (cfg.audience != "") { " for '${cfg.audience}'" } else { "" };
+    let who = if (cfg.issuer != "") {
+        "tokens from ${cfg.issuer} with scope '${cfg.scope}'${aud}"
+    } else {
+        "root token only"
+    };
+    print(
+        "rayvault ${VERSION}: ${scheme}://${cfg.host}:${r.port}, data in ${cfg.data}, ${who}, ${cfg.policies.len()} policies; sealed until `rayvault unseal`"
+    );
+    if (scheme == "http" && cfg.host != "127.0.0.1" && cfg.host != "localhost") {
+        eprint(
+            "rayvault: WARNING: plain HTTP on ${cfg.host}: secrets and tokens travel in the clear; set tls_cert and tls_key"
+        );
+    }
+    recv(webserver.shutdown_signals());
+    server.stop(r);
+    print("rayvault: stopped (sealed)");
+    Result.Ok(0)
+}
+
+// --- The client ---
+
+struct Client {
+    addr: string,
+    insecure: bool,
+    token: string,
+}
+
+fn client(argv: [string], with_token: bool) -> Result<Client, string> {
+    let addr = flag(argv, "--addr", env_or("RAYVAULT_ADDR", "http://127.0.0.1:8200"))
+        .strip_suffix("/")
+        .unwrap_or(flag(argv, "--addr", env_or("RAYVAULT_ADDR", "http://127.0.0.1:8200")));
+    let c = Client { addr: addr, insecure: has(argv, "--insecure"), token: "" };
+    if (!with_token) {
+        return Result.Ok(c);
+    }
+    let t = env_or("RAYVAULT_TOKEN", "");
+    if (t != "") {
+        c.token = t;
+        return Result.Ok(c);
+    }
+    let issuer = env_or("RAYVAULT_ISSUER", "");
+    let id = env_or("RAYVAULT_CLIENT_ID", "");
+    let secret = env_or("RAYVAULT_CLIENT_SECRET", "");
+    if (issuer == "" || id == "" || secret == "") {
+        return Result.Err(
+            "no credentials: set RAYVAULT_TOKEN, or RAYVAULT_ISSUER + RAYVAULT_CLIENT_ID + RAYVAULT_CLIENT_SECRET"
+        );
+    }
+    let p = provider.discover(issuer)?;
+    c.token = oauth2.client_credentials(
+        p.token_endpoint,
+        id,
+        secret,
+        env_or("RAYVAULT_SCOPE", "vault")
+    )?.access_token;
+    Result.Ok(c)
+}
+
+fn call(c: Client, method: string, path: string, body: json.Json) -> Result<json.Json, string> {
+    var o = http.options();
+    o.insecure_skip_verify = c.insecure;
+    o.timeout_millis = 30000;
+    var headers: [(string, string)] = [("Content-Type", "application/json")];
+    if (c.token != "") {
+        headers.push(("Authorization", "Bearer ${c.token}"));
+    }
+    let r = http.request_opts(method, c.addr + path, json.stringify(body).to_bytes(), headers, o)?;
+    let j = json.parse(from_utf8(r.body).unwrap_or("{}")).unwrap_or(json.Json.JObject(Map.new()));
+    if (r.status >= 300) {
+        return Result.Err("${r.status}: ${json.get_string(j, "error").unwrap_or("error")}");
+    }
+    Result.Ok(j)
+}
+
+fn obj(pairs: [(string, string)]) -> json.Json {
+    let m: Map<string, json.Json> = Map.new();
+    for (k, v) in pairs {
+        m.insert(k, json.Json.JStr(v));
+    }
+    json.Json.JObject(m)
+}
+
+fn none() -> json.Json {
+    json.Json.JObject(Map.new())
+}
+
+fn passphrase(prompt: string) -> Result<string, string> {
+    let p = env_or("RAYVAULT_PASSPHRASE", "");
+    if (p != "") {
+        return Result.Ok(p);
+    }
+    term.read_hidden(prompt)
+}
+
+// Each path segment percent-encoded (the server takes segments of A-Z a-z 0-9 . _ - anyway).
+fn enc(path: string) -> string {
+    join(path.split("/").map(url.url_encode), "/")
+}
+
+fn need(pos: [string], n: int, what: string) -> Result<int, string> {
+    if (pos.len() < n) { Result.Err("missing ${what}") } else { Result.Ok(0) }
+}
+
+fn run(argv: [string]) -> Result<int, string> {
+    let cmd = argv[0];
+    let pos = positional(argv.slice(1, argv.len()));
+    match (cmd) {
+        "serve" => serve(argv),
+        "status" => {
+            let j = call(client(argv, false)?, "GET", "/v1/sys/status", none())?;
+            print(
+                "initialized: ${json.get_bool(j, "initialized").unwrap_or(false)}, sealed: ${json.get_bool(j, "sealed").unwrap_or(true)}"
+            );
+            Result.Ok(0)
+        },
+        "init" => {
+            let p = passphrase("new unseal passphrase: ")?;
+            if (env_or("RAYVAULT_PASSPHRASE", "") == "" && term.read_hidden("again: ")? != p) {
+                return Result.Err("the passphrases differ");
+            }
+            let j = call(client(argv, false)?, "POST", "/v1/sys/init", obj([("passphrase", p)]))?;
+            print(json.get_string(j, "root_token").unwrap_or(""));
+            eprint(
+                "rayvault: initialized and unsealed. That is the root token: it is shown once. Keep the passphrase too: without it the data cannot be read."
+            );
+            Result.Ok(0)
+        },
+        "unseal" => {
+            call(
+                client(argv, false)?,
+                "POST",
+                "/v1/sys/unseal",
+                obj([("passphrase", passphrase("unseal passphrase: ")?)])
+            )?;
+            print("unsealed");
+            Result.Ok(0)
+        },
+        "seal" => {
+            call(client(argv, true)?, "POST", "/v1/sys/seal", none())?;
+            print("sealed");
+            Result.Ok(0)
+        },
+        "whoami" => {
+            let j = call(client(argv, true)?, "GET", "/v1/whoami", none())?;
+            let subjects = json.get_array(j, "subjects")
+                .unwrap_or([])
+                .map(fn(s: json.Json) -> string { json.as_string(s).unwrap_or("") });
+            print("${json.get_string(j, "name").unwrap_or("?")}: ${join(subjects, ", ")}");
+            Result.Ok(0)
+        },
+        "get" => {
+            need(pos, 1, "PATH")?;
+            let v = flag(argv, "--version", "");
+            let q = if (v == "") { "" } else { "?version=${v}" };
+            let j = call(client(argv, true)?, "GET", "/v1/secret/${enc(pos[0])}${q}", none())?;
+            print(json.get_string(j, "value").unwrap_or(""));
+            Result.Ok(0)
+        },
+        "put" => {
+            need(pos, 2, "PATH VALUE")?;
+            let value = if (pos[1] == "-") { input().unwrap_or("") } else { pos[1] };
+            var pairs = [("value", value)];
+            let ttl = flag(argv, "--ttl", "");
+            if (ttl != "") {
+                pairs.push(("ttl", ttl));
+            }
+            let j = call(client(argv, true)?, "PUT", "/v1/secret/${enc(pos[0])}", obj(pairs))?;
+            print("${pos[0]}: version ${json.get_int(j, "version").unwrap_or(0)}");
+            Result.Ok(0)
+        },
+        "ls" => {
+            let prefix = if (pos.len() > 0) { "/" + enc(pos[0]) } else { "" };
+            let j = call(client(argv, true)?, "GET", "/v1/list${prefix}", none())?;
+            for k in json.get_array(j, "keys").unwrap_or([]) {
+                print(json.as_string(k).unwrap_or(""));
+            }
+            Result.Ok(0)
+        },
+        "rm" => {
+            need(pos, 1, "PATH")?;
+            let j = call(client(argv, true)?, "DELETE", "/v1/secret/${enc(pos[0])}", none())?;
+            print("${pos[0]}: ${json.get_int(j, "deleted").unwrap_or(0)} version(s) deleted");
+            Result.Ok(0)
+        },
+        "wrap" => {
+            need(pos, 1, "PATH")?;
+            let j = call(
+                client(argv, true)?,
+                "POST",
+                "/v1/wrap/${enc(pos[0])}",
+                obj([("ttl", flag(argv, "--ttl", "10m"))])
+            )?;
+            print(json.get_string(j, "token").unwrap_or(""));
+            Result.Ok(0)
+        },
+        "unwrap" => {
+            need(pos, 1, "TOKEN")?;
+            let j = call(client(argv, false)?, "POST", "/v1/unwrap", obj([("token", pos[0])]))?;
+            print(json.get_string(j, "value").unwrap_or(""));
+            Result.Ok(0)
+        },
+        "audit" => {
+            if (pos.len() < 1 || pos[0] != "verify") {
+                return Result.Err("usage: rayvault audit verify [FILE]");
+            }
+            let file = if (pos.len() > 1) { pos[1] } else { "data/audit.log" };
+            let n = audit.verify(file)?;
+            print("${file}: ${n} lines, the chain holds");
+            Result.Ok(0)
+        },
+        "--version" => {
+            print(VERSION);
+            Result.Ok(0)
+        },
+        other => Result.Err("unknown command '${other}'\n\n${usage()}"),
+    }
+}
+
+fn main() -> int {
+    let argv = args();
+    if (argv.len() == 0 || argv[0] == "--help" || argv[0] == "-h") {
+        print(usage());
+        return if (argv.len() == 0) { 2 } else { 0 };
+    }
+    match (run(argv)) {
+        Result.Ok(_) => 0,
+        Result.Err(e) => {
+            eprint("rayvault: ${e}");
+            1
+        },
+    }
+}

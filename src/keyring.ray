@@ -1,0 +1,90 @@
+//! The keys. A random data key encrypts every secret; it is stored only wrapped by a key
+//! derived from the unseal passphrase (PBKDF2-HMAC-SHA256), so the database on disk is useless
+//! without the passphrase, and the data key exists only in the memory of an unsealed server.
+//!
+//! Each value is sealed with ChaCha20-Poly1305 under a fresh nonce, with its path and version
+//! as associated data: a ciphertext copied to another path or version no longer opens.
+
+import std/crypto;
+import std/hex;
+
+pub const ITERATIONS: int = 600000;
+
+const WRAP_AAD: string = "rayvault data key v1";
+
+/// What the database keeps to recover the data key.
+pub struct Wrapped {
+    salt: string,
+    iterations: int,
+    nonce: string,
+    wrapped: string,
+}
+
+fn kek(passphrase: string, salt: bytes, iterations: int) -> Result<bytes, string> {
+    crypto.pbkdf2_hmac_sha256(passphrase.to_bytes(), salt, iterations, 32).ok_or("pbkdf2 failed")
+}
+
+/// A new data key, and its wrapped form under `passphrase`.
+pub fn create(passphrase: string, iterations: int) -> Result<(bytes, Wrapped), string> {
+    let dek = crypto.random_bytes(32);
+    let salt = crypto.random_bytes(16);
+    let nonce = crypto.random_bytes(12);
+    let k = kek(passphrase, salt, iterations)?;
+    let w = crypto.chacha20poly1305_seal(k, nonce, WRAP_AAD.to_bytes(), dek).ok_or("seal failed")?;
+    Result.Ok(
+        (
+            dek,
+            Wrapped {
+                salt: hex.hex_encode(salt),
+                iterations: iterations,
+                nonce: hex.hex_encode(nonce),
+                wrapped: hex.hex_encode(w)
+            }
+        )
+    )
+}
+
+/// The data key, or `Err("wrong passphrase")`.
+pub fn open(passphrase: string, w: Wrapped) -> Result<bytes, string> {
+    let k = kek(passphrase, hex.hex_decode(w.salt)?, w.iterations)?;
+    crypto.chacha20poly1305_open(k, hex.hex_decode(w.nonce)?, WRAP_AAD.to_bytes(), hex.hex_decode(w.wrapped)?)
+        .ok_or("wrong passphrase")
+}
+
+fn aad(path: string, version: int) -> bytes {
+    "rayvault:v1:${path}#${version}".to_bytes()
+}
+
+/// nonce ‖ ciphertext ‖ tag, as hex.
+pub fn seal(dek: bytes, path: string, version: int, value: string) -> Result<string, string> {
+    let nonce = crypto.random_bytes(12);
+    let ct = crypto.chacha20poly1305_seal(dek, nonce, aad(path, version), value.to_bytes())
+        .ok_or("seal failed")?;
+    Result.Ok(hex.hex_encode(bytes_concat([nonce, ct])))
+}
+
+pub fn unseal_value(
+    dek: bytes,
+    path: string,
+    version: int,
+    sealed: string
+) -> Result<string, string> {
+    let b = hex.hex_decode(sealed)?;
+    if (b.len() < 12 + 16) {
+        return Result.Err("ciphertext too short");
+    }
+    let plain = crypto.chacha20poly1305_open(dek, b.sub_bytes(0, 12), aad(path, version), b.sub_bytes(12, b.len()))
+        .ok_or("ciphertext does not open (tampered, or moved from another path)")?;
+    from_utf8(plain)
+}
+
+/// A random token with a prefix that says what it is (`rvr_` root, `rvw_` wrap), and the
+/// SHA-256 the database keeps instead of it.
+pub fn token(prefix: string) -> (string, string) {
+    let t = prefix + hex.hex_encode(crypto.random_bytes(24));
+    (t, token_hash(t))
+}
+
+pub fn token_hash(t: string) -> string {
+    hex.hex_encode(crypto.sha256(t.to_bytes()))
+}

@@ -1,0 +1,390 @@
+//! The vault: one fiber owns the database and, while unsealed, the data key. Nothing else ever
+//! holds the key; handlers send it plaintext to seal and get plaintext back.
+//!
+//! States: not initialized → (init) → unsealed ⇄ sealed (seal / unseal). A restart always
+//! comes back sealed.
+
+import std/time;
+import db/sqlite;
+import keyring;
+
+pub struct Secret {
+    path: string,
+    version: int,
+    value: string,
+    created_ms: int,
+    /// 0 = never.
+    expires_ms: int,
+    by: string,
+}
+
+pub struct Status {
+    initialized: bool,
+    sealed: bool,
+}
+
+pub const KEEP_VERSIONS: int = 10;
+
+pub enum Msg {
+    State(Channel<Status>),
+    Init(string, Channel<Result<string, string>>),
+    Unseal(string, Channel<Result<int, string>>),
+    Seal(Channel<Result<int, string>>),
+    IsRoot(string, Channel<bool>),
+    Put(string, string, int, string, Channel<Result<int, string>>),
+    Get(string, int, Channel<Result<Secret, string>>),
+    List(string, Channel<Result<[string], string>>),
+    Delete(string, Channel<Result<int, string>>),
+    Wrap(string, int, Channel<Result<(string, int, int), string>>),
+    Unwrap(string, Channel<Result<Secret, string>>),
+    Stop(Channel<int>),
+}
+
+const SCHEMA: string = `
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = FULL;
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS secrets (
+    path TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    sealed TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    expires_ms INTEGER NOT NULL,
+    by TEXT NOT NULL,
+    PRIMARY KEY (path, version)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS wraps (
+    hash TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    expires_ms INTEGER NOT NULL
+);
+`;
+
+struct State {
+    c: sqlite.Conn,
+    /// The data key while unsealed, else empty.
+    dek: [bytes],
+    iterations: int,
+}
+
+pub fn start(db_path: string, iterations: int) -> Result<Channel<Msg>, string> {
+    let c0 = sqlite.connect(db_path)?;
+    sqlite.exec(c0, SCHEMA, [])?;
+    sqlite.disconnect(c0);
+    let inbox: Channel<Msg> = Channel.bounded(256);
+    let ready: Channel<Result<int, string>> = Channel.bounded(1);
+    spawn(fn() {
+        match (sqlite.connect(db_path)) {
+            Result.Ok(c) => {
+                // Annotated: a bare Result literal in send() does not build natively (#280).
+                let up: Result<int, string> = Result.Ok(0);
+                send(ready, up);
+                serve(State { c: c, dek: [], iterations: iterations }, inbox);
+                sqlite.disconnect(c);
+            },
+            Result.Err(e) => {
+                let down: Result<int, string> = Result.Err(e);
+                send(ready, down);
+            },
+        }
+    });
+    recv(ready).unwrap_or(Result.Err("vault fiber died"))?;
+    Result.Ok(inbox)
+}
+
+fn serve(s: State, inbox: Channel<Msg>) {
+    while (true) {
+        let m = match (recv(inbox)) {
+            Option.Some(m) => m,
+            Option.None => return,
+        };
+        match (m) {
+            Msg.State(r) => send(r, Status { initialized: meta(s, "wrapped").is_some(), sealed: s.dek.len() == 0 }),
+            Msg.Init(pass, r) => send(r, do_init(s, pass)),
+            Msg.Unseal(pass, r) => send(r, do_unseal(s, pass)),
+            Msg.Seal(r) => {
+                s.dek = [];
+                let ok: Result<int, string> = Result.Ok(0);
+                send(r, ok);
+            },
+            Msg.IsRoot(hash, r) => send(r, meta(s, "root").unwrap_or("") == hash && hash != ""),
+            Msg.Put(path, value, ttl, by, r) => send(r, do_put(s, path, value, ttl, by)),
+            Msg.Get(path, version, r) => send(r, do_get(s, path, version)),
+            Msg.List(prefix, r) => send(r, do_list(s, prefix)),
+            Msg.Delete(path, r) => send(r, do_delete(s, path)),
+            Msg.Wrap(path, ttl, r) => send(r, do_wrap(s, path, ttl)),
+            Msg.Unwrap(token, r) => send(r, do_unwrap(s, token)),
+            Msg.Stop(r) => {
+                s.dek = [];
+                send(r, 0);
+                return;
+            },
+        }
+    }
+}
+
+fn meta(s: State, k: string) -> Option<string> {
+    match (sqlite.query(s.c, "SELECT v FROM meta WHERE k = ?1", [k])) {
+        Result.Ok(rows) => if (rows.len() == 0) { Option.None } else { Option.Some(rows[0][0]) },
+        Result.Err(_) => Option.None,
+    }
+}
+
+fn set_meta(s: State, k: string, v: string) -> Result<int, string> {
+    sqlite.exec(s.c, "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, ?2)", [k, v])
+}
+
+fn do_init(s: State, pass: string) -> Result<string, string> {
+    if (meta(s, "wrapped").is_some()) {
+        return Result.Err("already initialized");
+    }
+    if (pass.len() < 12) {
+        return Result.Err("the passphrase needs at least 12 characters");
+    }
+    let (dek, w) = keyring.create(pass, s.iterations)?;
+    let (root, root_hash) = keyring.token("rvr_");
+    sqlite.exec(s.c, "BEGIN", [])?;
+    let r = store_init(s, w, root_hash);
+    match (r) {
+        Result.Ok(_) => sqlite.exec(s.c, "COMMIT", [])?,
+        Result.Err(e) => {
+            sqlite.exec(s.c, "ROLLBACK", []);
+            return Result.Err(e);
+        },
+    }
+    s.dek = [dek];
+    Result.Ok(root)
+}
+
+fn store_init(s: State, w: keyring.Wrapped, root_hash: string) -> Result<int, string> {
+    set_meta(s, "wrapped", w.wrapped)?;
+    set_meta(s, "salt", w.salt)?;
+    set_meta(s, "nonce", w.nonce)?;
+    set_meta(s, "iterations", to_string(w.iterations))?;
+    set_meta(s, "root", root_hash)
+}
+
+fn do_unseal(s: State, pass: string) -> Result<int, string> {
+    let w = match (meta(s, "wrapped")) {
+        Option.Some(w) => w,
+        Option.None => return Result.Err("not initialized"),
+    };
+    let wrapped = keyring.Wrapped {
+        salt: meta(s, "salt").unwrap_or(""),
+        iterations: parse_int(meta(s, "iterations").unwrap_or("0")).unwrap_or(0),
+        nonce: meta(s, "nonce").unwrap_or(""),
+        wrapped: w
+    };
+    s.dek = [keyring.open(pass, wrapped)?];
+    Result.Ok(0)
+}
+
+fn dek_of(s: State) -> Result<bytes, string> {
+    if (s.dek.len() == 0) {
+        if (meta(s, "wrapped").is_none()) {
+            return Result.Err("not initialized");
+        }
+        return Result.Err("sealed");
+    }
+    Result.Ok(s.dek[0])
+}
+
+fn latest(s: State, path: string) -> Result<int, string> {
+    let rows = sqlite.query(s.c, "SELECT MAX(version) FROM secrets WHERE path = ?1", [path])?;
+    Result.Ok(parse_int(rows[0][0]).unwrap_or(0))
+}
+
+fn do_put(s: State, path: string, value: string, ttl_ms: int, by: string) -> Result<int, string> {
+    let dek = dek_of(s)?;
+    let version = latest(s, path)? + 1;
+    let sealed = keyring.seal(dek, path, version, value)?;
+    let now = time.now();
+    let expires = if (ttl_ms > 0) { now + ttl_ms } else { 0 };
+    sqlite.exec(
+        s.c,
+        "INSERT INTO secrets (path, version, sealed, created_ms, expires_ms, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        [path, to_string(version), sealed, to_string(now), to_string(expires), by]
+    )?;
+    sqlite.exec(
+        s.c,
+        "DELETE FROM secrets WHERE path = ?1 AND version <= ?2",
+        [path, to_string(version - KEEP_VERSIONS)]
+    )?;
+    Result.Ok(version)
+}
+
+fn do_get(s: State, path: string, version: int) -> Result<Secret, string> {
+    let dek = dek_of(s)?;
+    let v = if (version > 0) { version } else { latest(s, path)? };
+    let rows = sqlite.query(
+        s.c,
+        "SELECT sealed, created_ms, expires_ms, by FROM secrets WHERE path = ?1 AND version = ?2",
+        [path, to_string(v)]
+    )?;
+    if (rows.len() == 0) {
+        return Result.Err("not found");
+    }
+    let r = rows[0];
+    let expires = parse_int(r[2]).unwrap_or(0);
+    if (expires > 0 && time.now() >= expires) {
+        return Result.Err("expired");
+    }
+    let value = keyring.unseal_value(dek, path, v, r[0])?;
+    Result.Ok(
+        Secret {
+            path: path,
+            version: v,
+            value: value,
+            created_ms: parse_int(r[1]).unwrap_or(0),
+            expires_ms: expires,
+            by: r[3]
+        }
+    )
+}
+
+/// The entries one level below `prefix` ("" = the top): a secret's last segment, or a folder
+/// with a trailing `/`, as in a file listing.
+fn do_list(s: State, prefix: string) -> Result<[string], string> {
+    dek_of(s)?;
+    let base = if (prefix == "") { "" } else { prefix + "/" };
+    let rows = sqlite.query(
+        s.c,
+        "SELECT DISTINCT path FROM secrets WHERE substr(path, 1, ?2) = ?1 ORDER BY path",
+        [base, to_string(base.len())]
+    )?;
+    var out: [string] = [];
+    for r in rows {
+        let rest = r[0].substring(base.len(), r[0].len());
+        let entry = match (rest.index_of("/")) {
+            Option.Some(i) => rest.substring(0, i + 1),
+            Option.None => rest,
+        };
+        if (out.len() == 0 || out[out.len() - 1] != entry) {
+            out.push(entry);
+        }
+    }
+    Result.Ok(out)
+}
+
+fn do_delete(s: State, path: string) -> Result<int, string> {
+    dek_of(s)?;
+    let n = sqlite.exec(s.c, "DELETE FROM secrets WHERE path = ?1", [path])?;
+    if (n == 0) {
+        return Result.Err("not found");
+    }
+    sqlite.exec(s.c, "DELETE FROM wraps WHERE path = ?1", [path])?;
+    Result.Ok(n)
+}
+
+fn do_wrap(s: State, path: string, ttl_ms: int) -> Result<(string, int, int), string> {
+    let current = do_get(s, path, 0)?;
+    let (t, h) = keyring.token("rvw_");
+    let expires = time.now() + ttl_ms;
+    sqlite.exec(s.c, "DELETE FROM wraps WHERE expires_ms < ?1", [to_string(time.now())])?;
+    sqlite.exec(
+        s.c,
+        "INSERT INTO wraps (hash, path, version, expires_ms) VALUES (?1, ?2, ?3, ?4)",
+        [h, path, to_string(current.version), to_string(expires)]
+    )?;
+    Result.Ok((t, current.version, expires))
+}
+
+// Once: the row goes before the value is handed out, whatever happens next.
+fn do_unwrap(s: State, token: string) -> Result<Secret, string> {
+    dek_of(s)?;
+    let h = keyring.token_hash(token);
+    let rows = sqlite.query(
+        s.c,
+        "SELECT path, version, expires_ms FROM wraps WHERE hash = ?1",
+        [h]
+    )?;
+    if (rows.len() == 0) {
+        return Result.Err("unknown or already used");
+    }
+    sqlite.exec(s.c, "DELETE FROM wraps WHERE hash = ?1", [h])?;
+    if (time.now() >= parse_int(rows[0][2]).unwrap_or(0)) {
+        return Result.Err("expired");
+    }
+    do_get(s, rows[0][0], parse_int(rows[0][1]).unwrap_or(0))
+}
+
+// --- The client side ---
+
+pub fn status(v: Channel<Msg>) -> Status {
+    let r: Channel<Status> = Channel.bounded(1);
+    send(v, Msg.State(r));
+    recv(r).unwrap_or(Status { initialized: false, sealed: true })
+}
+
+pub fn init(v: Channel<Msg>, pass: string) -> Result<string, string> {
+    let r: Channel<Result<string, string>> = Channel.bounded(1);
+    send(v, Msg.Init(pass, r));
+    recv(r).unwrap_or(Result.Err("vault stopped"))
+}
+
+pub fn unseal(v: Channel<Msg>, pass: string) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(v, Msg.Unseal(pass, r));
+    recv(r).unwrap_or(Result.Err("vault stopped"))
+}
+
+pub fn seal(v: Channel<Msg>) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(v, Msg.Seal(r));
+    recv(r).unwrap_or(Result.Err("vault stopped"))
+}
+
+pub fn is_root(v: Channel<Msg>, token: string) -> bool {
+    let r: Channel<bool> = Channel.bounded(1);
+    send(v, Msg.IsRoot(keyring.token_hash(token), r));
+    recv(r).unwrap_or(false)
+}
+
+pub fn put(
+    v: Channel<Msg>,
+    path: string,
+    value: string,
+    ttl_ms: int,
+    by: string
+) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(v, Msg.Put(path, value, ttl_ms, by, r));
+    recv(r).unwrap_or(Result.Err("vault stopped"))
+}
+
+pub fn get(v: Channel<Msg>, path: string, version: int) -> Result<Secret, string> {
+    let r: Channel<Result<Secret, string>> = Channel.bounded(1);
+    send(v, Msg.Get(path, version, r));
+    recv(r).unwrap_or(Result.Err("vault stopped"))
+}
+
+pub fn list(v: Channel<Msg>, prefix: string) -> Result<[string], string> {
+    let r: Channel<Result<[string], string>> = Channel.bounded(1);
+    send(v, Msg.List(prefix, r));
+    recv(r).unwrap_or(Result.Err("vault stopped"))
+}
+
+pub fn delete(v: Channel<Msg>, path: string) -> Result<int, string> {
+    let r: Channel<Result<int, string>> = Channel.bounded(1);
+    send(v, Msg.Delete(path, r));
+    recv(r).unwrap_or(Result.Err("vault stopped"))
+}
+
+pub fn wrap(v: Channel<Msg>, path: string, ttl_ms: int) -> Result<(string, int, int), string> {
+    let r: Channel<Result<(string, int, int), string>> = Channel.bounded(1);
+    send(v, Msg.Wrap(path, ttl_ms, r));
+    recv(r).unwrap_or(Result.Err("vault stopped"))
+}
+
+pub fn unwrap(v: Channel<Msg>, token: string) -> Result<Secret, string> {
+    let r: Channel<Result<Secret, string>> = Channel.bounded(1);
+    send(v, Msg.Unwrap(token, r));
+    recv(r).unwrap_or(Result.Err("vault stopped"))
+}
+
+pub fn stop(v: Channel<Msg>) {
+    let r: Channel<int> = Channel.bounded(1);
+    send(v, Msg.Stop(r));
+    recv(r);
+}

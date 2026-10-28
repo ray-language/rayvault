@@ -1,0 +1,212 @@
+// The service end to end, in one test (OS listeners outlive a test's fibers), with an issuer of
+// our own: an Ed25519 key, its JWKS handed to oidc/provider.with_keys, and RFC 9068 access
+// tokens signed here for a service account, a person in a group, another audience, an expired
+// one and a forged one.
+
+import oidc/provider;
+import std/base64;
+import std/crypto;
+import std/fs;
+import std/json;
+import std/net;
+import std/time;
+import net/http;
+import audit;
+import config;
+import server;
+
+const ISSUER: string = "https://auth.test";
+
+fn b64(s: string) -> string {
+    base64.base64url(s.to_bytes()).replace("=", "")
+}
+
+fn sign(seed: bytes, claims: json.Json) -> string {
+    let head = b64(`{"alg":"EdDSA","kid":"k1","typ":"at+jwt"}`);
+    let body = b64(json.stringify(claims));
+    let sig = crypto.ed25519_sign(seed, "${head}.${body}".to_bytes()).unwrap();
+    "${head}.${body}.${base64.base64url(sig).replace("=", "")}"
+}
+
+fn claims_scoped(
+    sub: string,
+    client_id: string,
+    aud: string,
+    groups: [string],
+    exp_s: int,
+    scope: string
+) -> json.Json {
+    let m: Map<string, json.Json> = Map.new();
+    m.insert("iss", json.Json.JStr(ISSUER));
+    m.insert("sub", json.Json.JStr(sub));
+    m.insert("aud", json.Json.JStr(aud));
+    m.insert("client_id", json.Json.JStr(client_id));
+    m.insert("scope", json.Json.JStr(scope));
+    m.insert(
+        "groups",
+        json.Json.JArray(groups.map(fn(g: string) -> json.Json { json.Json.JStr(g) }))
+    );
+    m.insert("iat", json.Json.JNum((time.now() / 1000) as float));
+    m.insert("exp", json.Json.JNum(exp_s as float));
+    m.insert("jti", json.Json.JStr(sub + to_string(exp_s)));
+    json.Json.JObject(m)
+}
+
+fn claims(sub: string, client_id: string, aud: string, groups: [string], exp_s: int) -> json.Json {
+    claims_scoped(sub, client_id, aud, groups, exp_s, "vault")
+}
+
+struct Svc {
+    run: server.Running,
+    base: string,
+}
+
+fn boot(data: string, providers: [provider.Provider]) -> Svc {
+    let src = `
+[server]
+listen = "127.0.0.1:0"
+data = "${data}"
+issuer = "${ISSUER}"
+scope = "vault"
+audience = "rayvault"
+
+[[policy]]
+subject = "client:sync-job"
+paths = ["apps/notes/*"]
+caps = ["read", "list"]
+
+[[policy]]
+subject = "group:ops"
+paths = ["apps/*"]
+caps = ["read", "write", "list", "delete", "wrap"]
+`;
+    let cfg = config.parse(src).unwrap();
+    let l = net.tcp_listen("127.0.0.1", 0).unwrap();
+    let r = server.start(cfg, l, providers, 1000).unwrap();
+    Svc { run: r, base: "http://127.0.0.1:${r.port}" }
+}
+
+fn call(s: Svc, method: string, path: string, token: string, body: string) -> (int, json.Json) {
+    var h: [(string, string)] = [];
+    if (token != "") {
+        h.push(("Authorization", "Bearer ${token}"));
+    }
+    let r = http.request_pairs(method, s.base + path, body.to_bytes(), h, 10000).unwrap();
+    (r.status, json.parse(from_utf8(r.body).unwrap_or("{}")).unwrap_or(json.Json.JNull))
+}
+
+fn status(s: Svc, method: string, path: string, token: string, body: string) -> int {
+    let (st, _) = call(s, method, path, token, body);
+    st
+}
+
+fn field(j: json.Json, k: string) -> string {
+    json.get_string(j, k).unwrap_or("")
+}
+
+@test
+fn vault_end_to_end() {
+    let seed = crypto.random_bytes(32);
+    let pubkey = crypto.ed25519_public_key(seed).unwrap();
+    let jwks = `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k1","alg":"EdDSA","use":"sig","x":"${base64.base64url(pubkey).replace("=", "")}"}]}`;
+    let p = provider.with_keys(ISSUER, "${ISSUER}/authorize", "${ISSUER}/token", "", jwks);
+    let later = time.now() / 1000 + 600;
+    let job = sign(seed, claims("sync-job", "sync-job", "rayvault", [], later));
+    let alice = sign(seed, claims("u-1", "notes-web", "rayvault", ["ops"], later));
+    let wrong_aud = sign(seed, claims("u-1", "notes-web", "notes-api", ["ops"], later));
+    let expired = sign(
+        seed,
+        claims("u-1", "notes-web", "rayvault", ["ops"], time.now() / 1000 - 600)
+    );
+    let no_scope = sign(
+        seed,
+        claims_scoped("u-1", "notes-web", "rayvault", ["ops"], later, "notes.read")
+    );
+    let forged = sign(
+        crypto.random_bytes(32),
+        claims("u-1", "notes-web", "rayvault", ["ops"], later)
+    );
+
+    let data = fs.make_temp_dir("rayvault-e2e").unwrap();
+    let s = boot(data, [p]);
+    let pass = `{"passphrase": "correct horse battery staple"}`;
+
+    // Before init everything says so; init gives the root token once.
+    assert_eq(status(s, "PUT", "/v1/secret/apps/notes/db", alice, `{"value": "x"}`), 503);
+    let (st, init) = call(s, "POST", "/v1/sys/init", "", pass);
+    assert_eq(st, 200);
+    let root = field(init, "root_token");
+    assert(root.starts_with("rvr_"));
+    assert_eq(status(s, "POST", "/v1/sys/init", "", pass), 400);
+
+    // Identity.
+    let (_, me) = call(s, "GET", "/v1/whoami", alice, "");
+    assert_eq(json.get_array(me, "subjects").unwrap().len(), 3);
+    assert_eq(status(s, "GET", "/v1/whoami", "", ""), 401);
+    assert_eq(status(s, "GET", "/v1/whoami", wrong_aud, ""), 401);
+    assert_eq(status(s, "GET", "/v1/whoami", expired, ""), 401);
+    assert_eq(status(s, "GET", "/v1/whoami", forged, ""), 401);
+    assert_eq(status(s, "GET", "/v1/whoami", no_scope, ""), 401);
+    assert_eq(status(s, "GET", "/v1/whoami", "rvr_0000", ""), 401);
+
+    // Policies: ops writes under apps/, the job only reads under apps/notes/.
+    assert_eq(status(s, "PUT", "/v1/secret/apps/notes/db", alice, `{"value": "s3cr3t-1"}`), 200);
+    assert_eq(status(s, "PUT", "/v1/secret/apps/notes/db", alice, `{"value": "s3cr3t-2"}`), 200);
+    assert_eq(status(s, "PUT", "/v1/secret/apps/web/tls", alice, `{"value": "pem"}`), 200);
+    let (st2, got) = call(s, "GET", "/v1/secret/apps/notes/db", job, "");
+    assert_eq((st2, field(got, "value"), field(got, "by")), (200, "s3cr3t-2", "client:notes-web"));
+    let (_, v1) = call(s, "GET", "/v1/secret/apps/notes/db?version=1", job, "");
+    assert_eq(field(v1, "value"), "s3cr3t-1");
+    assert_eq(status(s, "PUT", "/v1/secret/apps/notes/db", job, `{"value": "mine"}`), 403);
+    assert_eq(status(s, "GET", "/v1/secret/apps/web/tls", job, ""), 403);
+    assert_eq(status(s, "PUT", "/v1/secret/other/x", alice, `{"value": "no"}`), 403);
+    assert_eq(status(s, "GET", "/v1/secret/apps/../etc", alice, ""), 400);
+    let (_, ls) = call(s, "GET", "/v1/list/apps", alice, "");
+    assert_eq(json.get_array(ls, "keys").unwrap().len(), 2);
+    assert_eq(status(s, "GET", "/v1/list/apps/web", job, ""), 403);
+
+    // A wrap: once, without any other credential.
+    let (_, w) = call(s, "POST", "/v1/wrap/apps/notes/db", alice, `{"ttl": "1m"}`);
+    let wt = field(w, "token");
+    let (u1, once) = call(s, "POST", "/v1/unwrap", "", `{"token": "${wt}"}`);
+    assert_eq((u1, field(once, "value")), (200, "s3cr3t-2"));
+    assert_eq(status(s, "POST", "/v1/unwrap", "", `{"token": "${wt}"}`), 404);
+
+    // A secret with a lifetime.
+    assert_eq(
+        status(s, "PUT", "/v1/secret/apps/tmp", alice, `{"value": "brief", "ttl": "1s"}`),
+        200
+    );
+    time.sleep(1100);
+    assert_eq(status(s, "GET", "/v1/secret/apps/tmp", alice, ""), 404);
+
+    // Seal: only root, and then nothing reads.
+    assert_eq(status(s, "POST", "/v1/sys/seal", alice, ""), 403);
+    assert_eq(status(s, "POST", "/v1/sys/seal", root, ""), 200);
+    assert_eq(status(s, "GET", "/v1/secret/apps/notes/db", alice, ""), 503);
+    assert_eq(
+        status(s, "POST", "/v1/sys/unseal", "", `{"passphrase": "wrong but long enough"}`),
+        403
+    );
+    server.stop(s.run);
+
+    // A restart comes back sealed; the passphrase opens it again.
+    let s2 = boot(data, [p]);
+    assert_eq(status(s2, "GET", "/v1/secret/apps/notes/db", alice, ""), 503);
+    assert_eq(status(s2, "POST", "/v1/sys/unseal", "", pass), 200);
+    let (_, back) = call(s2, "GET", "/v1/secret/apps/notes/db", job, "");
+    assert_eq(field(back, "value"), "s3cr3t-2");
+    server.stop(s2.run);
+
+    // The audit log holds every request, in an unbroken chain, and no secret value.
+    let n = audit.verify("${data}/audit.log").unwrap();
+    assert(n >= 25);
+    let log = fs.read_file("${data}/audit.log").unwrap();
+    assert(!log.contains("s3cr3t") && !log.contains("brief") && !log.contains(root));
+    assert(
+        log.contains(`"op":"read"`)
+            && log.contains(`"who":"client:sync-job"`)
+            && log.contains(`"detail":"denied"`)
+    );
+    fs.remove_all(data);
+}

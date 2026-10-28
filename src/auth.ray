@@ -1,0 +1,67 @@
+//! Who is calling. A `rvr_` token is the root token (checked against its hash in the vault);
+//! anything else must be an RFC 9068 access token from the configured issuer (rayauth) with
+//! the vault's scope (and its audience, when one is configured). The caller becomes a list of policy subjects.
+
+import oidc/provider;
+import oidc/tokens;
+import std/time;
+import vault;
+
+pub struct Who {
+    /// For the audit log and the `by` of what it writes.
+    name: string,
+    subjects: [string],
+}
+
+pub fn bearer(header: string) -> Option<string> {
+    let t = header.strip_prefix("Bearer ")?.trim();
+    if (t == "") { Option.None } else { Option.Some(t) }
+}
+
+/// `providers` holds the issuer when one is configured (an empty list = root token only).
+pub fn identify(
+    v: Channel<vault.Msg>,
+    providers: [provider.Provider],
+    scope: string,
+    audience: string,
+    token: string
+) -> Result<Who, string> {
+    if (token.starts_with("rvr_")) {
+        return if (vault.is_root(v, token)) {
+            Result.Ok(Who { name: "root", subjects: ["root"] })
+        } else {
+            Result.Err("unknown root token")
+        };
+    }
+    if (providers.len() == 0) {
+        return Result.Err("no issuer configured: only the root token is accepted");
+    }
+    let required = if (scope == "") { [] } else { [scope] };
+    let c = tokens.verify_access_token(providers[0], token, required, time.now())?;
+    // RFC 9068 §4: the resource server checks that it is the audience. verify_access_token
+    // does not (finding), so with an audience configured a token for another API is refused here.
+    if (audience != "" && !tokens.audience_has(c.raw, audience)) {
+        return Result.Err("the token is not for audience '${audience}'");
+    }
+    var subjects: [string] = [];
+    if (c.client_id != "") {
+        subjects.push("client:${c.client_id}");
+    }
+    if (c.sub != "") {
+        subjects.push("user:${c.sub}");
+    }
+    if (c.preferred_username != "") {
+        subjects.push("user:${c.preferred_username}");
+    }
+    for g in c.groups {
+        subjects.push("group:${g}");
+    }
+    let name = if (c.preferred_username != "") {
+        c.preferred_username
+    } else if (c.client_id != "") {
+        "client:${c.client_id}"
+    } else {
+        c.sub
+    };
+    Result.Ok(Who { name: name, subjects: subjects })
+}
