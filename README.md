@@ -84,7 +84,9 @@ src/audit.ray    el log de auditoría encadenado
 
 ## Hallazgos de dogfood
 
-En `../findings/open/rayvault-1.27.85.md`:
+En `../findings/open/rayvault-1.27.85.md`. Re-medido con 1.27.86 y oidc 0.2.0: #289 arreglado (`verify_access_token_for`); #290 (rayauth) sin re-medir.
+
+Lo que se encontró con 1.27.85:
 
 - **#289 [B] oidc**: `tokens.verify_access_token` no comprueba `aud`, y un token para otro API del mismo
   emisor pasa. rayvault la comprueba aparte cuando se configura una audiencia.
