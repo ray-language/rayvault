@@ -84,7 +84,7 @@ src/audit.ray    el log de auditoría encadenado
 
 ## Hallazgos de dogfood
 
-En `../findings/open/rayvault-1.27.85.md`. Re-medido con 1.27.86 y oidc 0.2.0: #289 arreglado (`verify_access_token_for`); #290 (rayauth) sin re-medir.
+En `../findings/open/rayvault-1.27.85.md`. Re-medido con 1.27.86 y oidc 0.2.0: #289 arreglado: rayvault usa ya `verify_access_token_for`; #290 (rayauth) sin re-medir.
 
 Lo que se encontró con 1.27.85:
 

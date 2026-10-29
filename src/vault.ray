@@ -77,15 +77,12 @@ pub fn start(db_path: string, iterations: int) -> Result<Channel<Msg>, string> {
     spawn(fn() {
         match (sqlite.connect(db_path)) {
             Result.Ok(c) => {
-                // Annotated: a bare Result literal in send() does not build natively (#280).
-                let up: Result<int, string> = Result.Ok(0);
-                send(ready, up);
+                send(ready, Result.Ok(0));
                 serve(State { c: c, dek: [], iterations: iterations }, inbox);
                 sqlite.disconnect(c);
             },
             Result.Err(e) => {
-                let down: Result<int, string> = Result.Err(e);
-                send(ready, down);
+                send(ready, Result.Err(e));
             },
         }
     });
@@ -105,8 +102,7 @@ fn serve(s: State, inbox: Channel<Msg>) {
             Msg.Unseal(pass, r) => send(r, do_unseal(s, pass)),
             Msg.Seal(r) => {
                 s.dek = [];
-                let ok: Result<int, string> = Result.Ok(0);
-                send(r, ok);
+                send(r, Result.Ok(0));
             },
             Msg.IsRoot(hash, r) => send(r, meta(s, "root").unwrap_or("") == hash && hash != ""),
             Msg.Put(path, value, ttl, by, r) => send(r, do_put(s, path, value, ttl, by)),

@@ -37,12 +37,12 @@ pub fn identify(
         return Result.Err("no issuer configured: only the root token is accepted");
     }
     let required = if (scope == "") { [] } else { [scope] };
-    let c = tokens.verify_access_token(providers[0], token, required, time.now())?;
-    // RFC 9068 §4: the resource server checks that it is the audience. verify_access_token
-    // does not (finding), so with an audience configured a token for another API is refused here.
-    if (audience != "" && !tokens.audience_has(c.raw, audience)) {
-        return Result.Err("the token is not for audience '${audience}'");
-    }
+    // RFC 9068 §4: with an audience configured, a token for another API is refused.
+    let c = if (audience == "") {
+        tokens.verify_access_token(providers[0], token, required, time.now())?
+    } else {
+        tokens.verify_access_token_for(providers[0], token, audience, required, time.now())?
+    };
     var subjects: [string] = [];
     if (c.client_id != "") {
         subjects.push("client:${c.client_id}");
