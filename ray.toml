@@ -5,6 +5,6 @@ license = "Apache-2.0"
 raylang = "1.27.86"
 
 [dependencies]
-net = "^0.13.0"
-db = "^0.7.0"
+net = "^0.14.0"
+db = "^0.7.2"
 oidc = "^0.2.0"
